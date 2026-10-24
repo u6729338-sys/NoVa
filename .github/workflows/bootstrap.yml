@@ -20,9 +20,14 @@ jobs:
         with:
           channel: stable
 
+      - name: Install archive extractor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
       - name: Extract NOVA project
         run: |
-          unzip -o NOVA_v1_2_Fresh.zip -d .
+          7z x -y NOVA_v1_2_Fresh.zip -o.
           if [ ! -f android/gradlew ]; then
             flutter create --platforms=android --project-name nova .
           fi
