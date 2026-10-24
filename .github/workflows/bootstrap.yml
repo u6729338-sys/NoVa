@@ -15,6 +15,11 @@ jobs:
       - name: Get repository
         uses: actions/checkout@v4
 
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
       - name: Extract NOVA project
         run: |
           unzip -o NOVA_Flutter_Starter.zip -d .
@@ -22,15 +27,11 @@ jobs:
             flutter create --platforms=android --project-name nova .
           fi
 
-      - name: Install Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
+      - name: Install dependencies
+        run: flutter pub get
 
       - name: Build APK
-        run: |
-          flutter pub get
-          flutter build apk --release
+        run: flutter build apk --release
 
       - name: Save APK
         uses: actions/upload-artifact@v4
