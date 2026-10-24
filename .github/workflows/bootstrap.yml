@@ -22,7 +22,7 @@ jobs:
 
       - name: Extract NOVA project
         run: |
-          unzip -o NOVA_Flutter_Starter.zip -d .
+          unzip -o NOVA_v1_2_Fresh.zip -d .
           if [ ! -f android/gradlew ]; then
             flutter create --platforms=android --project-name nova .
           fi
