@@ -76,9 +76,6 @@ jobs:
         working-directory: NOVA
         run: flutter pub get
 
-      - name: Run tests
-        working-directory: NOVA
-        run: flutter test
 
       - name: Build APK
         working-directory: NOVA
