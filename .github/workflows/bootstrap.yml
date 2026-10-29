@@ -1,45 +1,88 @@
 name: Build NOVA APK
 
 on:
-  push:
-  workflow_dispatch:
+push:
+workflow_dispatch:
 
 permissions:
-  contents: read
+contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+build:
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Get repository
-        uses: actions/checkout@v4
+steps:
+  - name: Get repository
+    uses: actions/checkout@v4
 
-      - name: Install Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
+  - name: Install Java
+    uses: actions/setup-java@v4
+    with:
+      distribution: temurin
+      java-version: '17'
 
-      - name: Install archive extractor
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y p7zip-full
+  - name: Install Flutter
+    uses: subosito/flutter-action@v2
+    with:
+      channel: stable
+      cache: true
 
-      - name: Extract NOVA project
-        run: |
-          7z x -y NOVA_v1_2_Fresh.zip -o.
-          if [ ! -f android/gradlew ]; then
-            flutter create --platforms=android --project-name nova .
-          fi
+  - name: Install archive extractor
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y p7zip-full
 
-      - name: Install dependencies
-        run: flutter pub get
+  - name: Extract NOVA project
+    run: |
+      set -e
+      7z x -y NOVA_v2_1_Combined_Android_Windows.zip -o.
+      test -f NOVA/pubspec.yaml
 
-      - name: Build APK
-        run: flutter build apk --release
+  - name: Generate Android project
+    working-directory: NOVA
+    run: flutter create --platforms=android --project-name nova .
 
-      - name: Save APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: NOVA-Android-APK
-          path: build/app/outputs/flutter-apk/app-release.apk
+  - name: Set Android compile SDK to 36
+    working-directory: NOVA
+    run: |
+      python3 - <<'PY'
+      from pathlib import Path
+      p = Path("android/app/build.gradle")
+      if not p.exists():
+          p = Path("android/app/build.gradle.kts")
+      if not p.exists():
+          raise SystemExit("Android Gradle build file not found")
+      s = p.read_text()
+      if p.name == "build.gradle.kts":
+          s = s.replace("compileSdk = flutter.compileSdkVersion", "compileSdk = 36")
+          s = s.replace("compileSdk = flutter.compileSdkVersion,", "compileSdk = 36,")
+      else:
+          s = s.replace("compileSdkVersion flutter.compileSdkVersion", "compileSdkVersion 36")
+          s = s.replace("compileSdk = flutter.compileSdkVersion", "compileSdk = 36")
+      p.write_text(s)
+      if "compileSdk = 36" not in s and "compileSdkVersion 36" not in s:
+          raise SystemExit("Could not update compile SDK to 36")
+      PY
+
+  - name: Configure Android permissions
+    working-directory: NOVA
+    run: python3 scripts/ensure_android_permissions.py
+
+  - name: Install dependencies
+    working-directory: NOVA
+    run: flutter pub get
+
+  - name: Run tests
+    working-directory: NOVA
+    run: flutter test
+
+  - name: Build APK
+    working-directory: NOVA
+    run: flutter build apk --release
+
+  - name: Save APK
+    uses: actions/upload-artifact@v4
+    with:
+      name: NOVA-Android-APK
+      path: NOVA/build/app/outputs/flutter-apk/app-release.apk
+      if-no-files-found: error
