@@ -34,7 +34,7 @@ jobs:
       - name: Extract NOVA project
         run: |
           set -e
-          7z x -y NOVA_v2_1_Combined_Android_Windows.zip -o.
+          7z x -y NOVA_v3_4_Android_Overlay_Repair.zip -o.
           test -f NOVA/pubspec.yaml
 
       - name: Generate Android project
