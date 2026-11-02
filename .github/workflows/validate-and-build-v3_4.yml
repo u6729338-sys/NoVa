@@ -1,0 +1,263 @@
+name: NOVA Validate and Build
+
+# Separate from bootstrap.yml / build.yml / flutter-ci.yml. Touches no repo files.
+# Flow: validate job (pub get, analyze, tests) -> build job (Android + release APK).
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_zip:
+        description: 'Exact NOVA source ZIP in repository root.'
+        required: false
+        default: 'NOVA_v3_4_Android_Overlay_Repair.zip'
+        type: string
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Cancel an older run of the same PR/branch when a newer one starts (no duplicate builds).
+concurrency:
+  group: nova-validate-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SRC_DIR: _nova_src
+
+jobs:
+  validate:
+    name: Validate (pub get, analyze, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      source_mode: ${{ steps.locate.outputs.source_mode }}
+      zip_path: ${{ steps.locate.outputs.zip_path }}
+      pubspec_in_zip: ${{ steps.locate.outputs.pubspec_in_zip }}
+      project_version: ${{ steps.locate.outputs.project_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Locate NOVA project (repo root or project zip)
+        id: locate
+        env:
+          INPUT_ZIP: ${{ github.event.inputs.project_zip }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INPUT_ZIP:-}" ] && [ -f pubspec.yaml ] && grep -q 'sdk: flutter' pubspec.yaml; then
+            echo "source_mode=root" >> "$GITHUB_OUTPUT"
+            echo "zip_path=" >> "$GITHUB_OUTPUT"
+            echo "pubspec_in_zip=" >> "$GITHUB_OUTPUT"
+            echo "project_version=$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+            echo "Project found at repository root."
+            exit 0
+          fi
+
+          if [ -n "${INPUT_ZIP:-}" ]; then
+            [ -f "$INPUT_ZIP" ] || { echo "::error::project_zip '$INPUT_ZIP' not found in repository root."; exit 1; }
+            candidates=("$INPUT_ZIP")
+          else
+            shopt -s nullglob
+            candidates=(*.zip)
+          fi
+          [ "${#candidates[@]}" -gt 0 ] || { echo "::error::No pubspec.yaml at repo root and no .zip files found."; exit 1; }
+
+          best_ver=""; best_zip=""; best_pub=""
+          for z in "${candidates[@]}"; do
+            pub=$(unzip -Z1 "$z" 2>/dev/null | grep -E '(^|/)pubspec\.yaml$' | awk '{print gsub("/","/") " " $0}' | sort -n | head -1 | cut -d' ' -f2- || true)
+            [ -n "$pub" ] || { echo "Skipping $z (no pubspec.yaml)"; continue; }
+            content=$(unzip -p "$z" "$pub")
+            echo "$content" | grep -q 'sdk: flutter' || { echo "Skipping $z (not a Flutter project)"; continue; }
+            ver=$(echo "$content" | grep -m1 '^version:' | awk '{print $2}' | cut -d+ -f1)
+            echo "Candidate: $z  ($pub, version ${ver:-unknown})"
+            if [ -z "$best_zip" ] || [ "$(printf '%s\n%s\n' "${ver:-0}" "$best_ver" | sort -V | tail -1)" = "${ver:-0}" ]; then
+              best_ver="${ver:-0}"; best_zip="$z"; best_pub="$pub"
+            fi
+          done
+          [ -n "$best_zip" ] || { echo "::error::No zip in the repository contains a Flutter project (pubspec.yaml with 'sdk: flutter')."; exit 1; }
+          echo "Selected: $best_zip (version $best_ver)"
+          echo "source_mode=zip" >> "$GITHUB_OUTPUT"
+          echo "zip_path=$best_zip" >> "$GITHUB_OUTPUT"
+          echo "pubspec_in_zip=$best_pub" >> "$GITHUB_OUTPUT"
+          echo "project_version=$best_ver" >> "$GITHUB_OUTPUT"
+
+      - name: Extract project from zip
+        if: steps.locate.outputs.source_mode == 'zip'
+        run: |
+          set -euo pipefail
+          mkdir -p "$SRC_DIR"
+          unzip -q "${{ steps.locate.outputs.zip_path }}" -d "$SRC_DIR"
+          test -f "$SRC_DIR/${{ steps.locate.outputs.pubspec_in_zip }}"
+          echo "Extracted to $SRC_DIR"
+
+      - name: Resolve project directory
+        id: proj
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.locate.outputs.source_mode }}" = "root" ]; then
+            dir="."
+          else
+            dir="$(dirname "$SRC_DIR/${{ steps.locate.outputs.pubspec_in_zip }}")"
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Project directory: $dir"
+          ls "$dir"
+
+      - name: Resolve dependencies (flutter pub get)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: flutter pub get
+
+      - name: Static analysis (errors fail, warnings/infos are reported)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set +e
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee analyze.log
+          status=${PIPESTATUS[0]}
+          errors=$(grep -cE '^\s*error •' analyze.log || true)
+          warnings=$(grep -cE '^\s*warning •' analyze.log || true)
+          infos=$(grep -cE '^\s*info •' analyze.log || true)
+          grep -E '^\s*error •' analyze.log | while read -r l; do echo "::error::$l"; done
+          grep -E '^\s*warning •' analyze.log | head -50 | while read -r l; do echo "::warning::$l"; done
+          {
+            echo "### flutter analyze"
+            echo "| Errors | Warnings | Infos |"
+            echo "|---|---|---|"
+            echo "| $errors | $warnings | $infos |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::flutter analyze reported errors (exit $status). See log above."
+            exit "$status"
+          fi
+
+      - name: Run Flutter tests (if test files exist)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if find test -name '*_test.dart' 2>/dev/null | grep -q .; then
+            flutter test 2>&1 | tee test.log
+            echo "### flutter test: passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::notice::No *_test.dart files found; skipping flutter test."
+            echo "### flutter test: skipped (no test files)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build-android:
+    name: Build release APK
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Extract project from zip
+        if: needs.validate.outputs.source_mode == 'zip'
+        run: |
+          set -euo pipefail
+          mkdir -p "$SRC_DIR"
+          unzip -q "${{ needs.validate.outputs.zip_path }}" -d "$SRC_DIR"
+          test -f "$SRC_DIR/${{ needs.validate.outputs.pubspec_in_zip }}"
+
+      - name: Resolve project directory
+        id: proj
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.validate.outputs.source_mode }}" = "root" ]; then
+            dir="."
+          else
+            dir="$(dirname "$SRC_DIR/${{ needs.validate.outputs.pubspec_in_zip }}")"
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Building NOVA ${{ needs.validate.outputs.project_version }} from: $dir"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('_nova_src/**/pubspec.yaml', 'pubspec.yaml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Generate Android project (keeps existing android/ if present)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: flutter create --platforms=android --project-name nova .
+
+      - name: Apply NOVA Android configuration (permissions, SDK 36, overlay, reminders)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          for s in ensure_android_permissions configure_android_overlay configure_android_reminders; do
+            if [ -f "scripts/$s.py" ]; then
+              echo "::group::$s.py"
+              python3 "scripts/$s.py"
+              echo "::endgroup::"
+            else
+              echo "::warning::scripts/$s.py not found in this project version; step skipped."
+            fi
+          done
+
+      - name: Verify Android configuration
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          echo "--- compile/min SDK ---"
+          grep -RnE 'compileSdk|minSdk' android/app/build.gradle* || true
+          grep -qE 'compileSdk(Version)?[ =]+36' android/app/build.gradle* \
+            || echo "::warning::compileSdk is not 36 in android/app/build.gradle*"
+          echo "--- manifest permissions ---"
+          grep -n 'uses-permission' android/app/src/main/AndroidManifest.xml || true
+
+      - name: Resolve dependencies
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: flutter build apk --release
+
+      - name: Confirm APK exists
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          apk="build/app/outputs/flutter-apk/app-release.apk"
+          if [ ! -f "$apk" ]; then
+            echo "::error::Release APK missing at $apk. The build did not produce an APK."
+            exit 1
+          fi
+          ls -lh "$apk"
+          echo "APK size: $(du -h "$apk" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOVA-Android-APK-validated
+          path: ${{ steps.proj.outputs.dir }}/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+          if-no-files-found: error
